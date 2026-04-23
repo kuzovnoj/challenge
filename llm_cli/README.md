@@ -1,16 +1,28 @@
-# LLM CLI Chat
+# LLM CLI Chat с RAG
 
-Простое CLI-приложение для общения с локальными LLM моделями через Ollama.
+Локальный чат с LLM через Ollama и поддержкой Retrieval-Augmented Generation.
 
-## Требования
+## 🚀 Возможности
 
-- Python 3.8+
-- Установленная и запущенная [Ollama](https://ollama.ai)
-- Хотя бы одна модель в Ollama (например, `llama3.2`, `mistral`)
+- ✅ Полностью локальная работа (без облака)
+- ✅ Чат с любой моделью из Ollama
+- ✅ RAG: поиск по вашим документам
+- ✅ Стриминг ответов в реальном времени
+- ✅ Сохранение контекста диалога
+- ✅ Кэширование эмбеддингов для скорости
+- ✅ Поддержка txt, md, py, js, html, css файлов
 
-## Установка
+## 📦 Установка
 
-1. Клонируйте или скачайте файлы проекта
-2. Установите зависимости:
-   ```bash
-   pip install -r requirements.txt
+```bash
+# 1. Клонируйте репозиторий
+git clone <repo>
+cd llm-cli
+
+# 2. Установите зависимости
+pip install -r requirements.txt
+
+# 3. Установите Ollama и модели
+# Скачайте с https://ollama.ai
+ollama pull llama3.2
+ollama pull nomic-embed-text
