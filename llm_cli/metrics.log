@@ -1,0 +1,2 @@
+{"timestamp": "2026-04-24T09:26:01.752941", "model": "llama3.2:3b", "optimize_mode": true, "ttft": 76.6178994178772, "total_time": 158.59515738487244, "eval_count": 267, "prompt_eval_count": 31}
+{"timestamp": "2026-04-24T09:31:09.466999", "model": "llama3.2:3b", "optimize_mode": false, "ttft": 114.48482775688171, "total_time": 156.0302300453186, "eval_count": 119, "prompt_eval_count": 819}

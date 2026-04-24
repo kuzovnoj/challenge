@@ -8,6 +8,10 @@ import argparse
 import sys
 from pathlib import Path
 from typing import List, Dict, Optional
+import time
+import json
+from datetime import datetime
+
 
 try:
     import ollama
@@ -57,6 +61,12 @@ class LocalLLMChat:
         self.vector_store = None
         self.top_k = top_k
         self.min_similarity = min_similarity
+        # optimization & metrics
+        self.optimize_mode = False
+        self.temperature = None
+        self.max_tokens = None
+        self.max_history = None
+        self.metrics_log_file = Path("metrics.log")
 
         if not no_rag and RAG_AVAILABLE:
             # Пытаемся загрузить существующий индекс из папки по умолчанию
@@ -149,7 +159,7 @@ class LocalLLMChat:
         self.add_user_message(user_input)
         api_messages = self.messages.copy()
 
-        # --- RAG: получаем контекст и запоминаем результаты поиска ---
+        # --- RAG сохранён без изменений ---
         rag_context = None
         rag_sources = set()
         if self.rag_enabled:
@@ -160,7 +170,6 @@ class LocalLLMChat:
                 min_similarity=self.min_similarity
             )
             if results:
-                # Собираем контекст для промпта
                 context_parts = []
                 for i, (text, metadata, score) in enumerate(results, 1):
                     source = metadata.get('filename', 'unknown')
@@ -177,24 +186,52 @@ class LocalLLMChat:
             )
             api_messages.insert(0, {"role": "system", "content": system_prompt})
             print(f"🔍 [RAG] Найдено релевантных фрагментов в: {', '.join(rag_sources)}")
-        # -------------------------------------------------------------
+
+        # --- Настройки оптимизации ---
+        options = {}
+        if self.optimize_mode:
+            if self.temperature is not None:
+                options['temperature'] = self.temperature
+            if self.max_tokens is not None:
+                options['num_predict'] = self.max_tokens
+            if self.max_history is not None:
+                # Оставляем последние max_history пользовательских и ассистентских сообщений
+                # + system message если есть
+                # Упростим: обрезаем api_messages без system
+                # api_messages содержит system (если RAG) + история в порядке добавления.
+                # system message всегда первое, его не трогаем.
+                # История начинается с индекса 1 (если system есть) или 0 (если нет).
+                system_msg = api_messages[0] if api_messages and api_messages[0]['role'] == 'system' else None
+                if system_msg is None:
+                    # обрезаем последние max_history сообщений (пар user+assistant)
+                    start_index = max(0, len(api_messages) - self.max_history * 2)
+                else:
+                    # не трогаем system, обрезаем историю
+                    start_index = max(1, len(api_messages) - self.max_history * 2)
+                api_messages = api_messages[start_index:]
+
+        # --- Выполнение запроса с замером времени ---
+        start_time = time.time()
+        first_token_time = None
+        full_response = ""
+        eval_count = 0
+        prompt_eval_count = 0
 
         try:
             stream = ollama.chat(
                 model=self.model,
                 messages=api_messages,
                 stream=True,
+                options=options if options else None
             )
-            # Выбор префикса в зависимости от использования RAG
             if rag_context:
                 print("\n🤖 [RAG] ", end="", flush=True)
             else:
                 print("\n🤖 ", end="", flush=True)
 
-            full_response = ""
-
             for chunk in stream:
                 content = None
+                # Обработка контента (как раньше)
                 if hasattr(chunk, 'message') and hasattr(chunk.message, 'content'):
                     content = chunk.message.content
                 elif isinstance(chunk, dict):
@@ -203,13 +240,50 @@ class LocalLLMChat:
                     elif 'response' in chunk:
                         content = chunk['response']
                 if content:
+                    if first_token_time is None:
+                        first_token_time = time.time()
                     print(content, end="", flush=True)
                     full_response += content
 
+                # Сбор информации о завершении
+                if hasattr(chunk, 'done') and chunk.done:
+                    # Извлекаем статистику токенов (у разных SDK могут быть разные поля)
+                    if hasattr(chunk, 'eval_count'):
+                        eval_count = chunk.eval_count or 0
+                    if hasattr(chunk, 'prompt_eval_count'):
+                        prompt_eval_count = chunk.prompt_eval_count or 0
+                elif isinstance(chunk, dict) and chunk.get('done'):
+                    eval_count = chunk.get('eval_count', 0)
+                    prompt_eval_count = chunk.get('prompt_eval_count', 0)
+
+            end_time = time.time()
             print("\n")
             self.add_assistant_message(full_response)
 
-            # Вывод источников, если использовался RAG
+            # --- Метрики ---
+            ttft = (first_token_time - start_time) if first_token_time else None
+            total_time = end_time - start_time
+
+            # Вывод в терминал
+            print("⏱️  Метрики:")
+            if ttft is not None:
+                print(f"   Время до первого токена: {ttft:.2f} сек")
+            print(f"   Общее время генерации: {total_time:.2f} сек")
+            if eval_count > 0:
+                print(f"   Токенов сгенерировано: {eval_count}")
+                if total_time > 0:
+                    print(f"   Скорость: {eval_count/total_time:.1f} токен/сек")
+            print()
+
+            # Логирование
+            self.log_metrics({
+                "ttft": ttft,
+                "total_time": total_time,
+                "eval_count": eval_count,
+                "prompt_eval_count": prompt_eval_count
+            })
+
+            # Источники RAG
             if rag_sources:
                 print(f"📚 Использованные источники: {', '.join(rag_sources)}\n")
 
@@ -328,6 +402,103 @@ class LocalLLMChat:
             print(f"{i}. [{source}] (score: {score:.3f})")
             print(f"   {text[:200]}...\n")
 
+    def toggle_optimize(self, state: str = None) -> None:
+        """Включает/выключает режим оптимизации."""
+        if state is None:
+            self.show_optimize_status()
+            return
+        if state.lower() == 'on':
+            self.optimize_mode = True
+            print("✅ Режим оптимизации ВКЛЮЧЕН")
+        elif state.lower() == 'off':
+            self.optimize_mode = False
+            print("✅ Режим оптимизации ВЫКЛЮЧЕН")
+        else:
+            print("❓ Используйте: /optimize on|off")
+
+    def show_optimize_status(self) -> None:
+        """Показывает текущие настройки оптимизации."""
+        status = "ВКЛЮЧЕН" if self.optimize_mode else "ВЫКЛЮЧЕН"
+        print(f"\n⚙️  Режим оптимизации: {status}")
+        temp = f"{self.temperature:.2f}" if self.temperature is not None else "по умолчанию"
+        mt = str(self.max_tokens) if self.max_tokens is not None else "по умолчанию"
+        mh = str(self.max_history) if self.max_history is not None else "по умолчанию"
+        print(f"   temperature = {temp}")
+        print(f"   max_tokens  = {mt}")
+        print(f"   max_history = {mh}")
+        print()
+
+    def set_param(self, param: str, value: str) -> None:
+        """Устанавливает параметр оптимизации."""
+        param = param.lower()
+        try:
+            if param == 'temperature':
+                self.temperature = float(value)
+                print(f"✅ temperature = {self.temperature:.2f}")
+            elif param == 'max_tokens':
+                self.max_tokens = int(value)
+                print(f"✅ max_tokens = {self.max_tokens}")
+            elif param == 'history':
+                self.max_history = int(value)
+                print(f"✅ max_history = {self.max_history}")
+            else:
+                print(f"❓ Неизвестный параметр: {param}")
+                print("   Доступные: temperature, max_tokens, history")
+        except ValueError:
+            print(f"❌ Неверное значение для {param}: {value}")
+
+    def load_config(self, filepath: str) -> None:
+        """Загружает параметры из JSON-файла."""
+        path = Path(filepath)
+        if not path.exists():
+            print(f"❌ Файл не найден: {filepath}")
+            return
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                config = json.load(f)
+            for key in ['temperature', 'max_tokens', 'max_history']:
+                if key in config:
+                    setattr(self, key, config[key])
+            print(f"✅ Настройки загружены из {filepath}")
+            self.show_optimize_status()
+        except Exception as e:
+            print(f"❌ Ошибка загрузки конфига: {e}")
+
+    def log_metrics(self, data: dict) -> None:
+        """Записывает метрики в лог-файл."""
+        try:
+            entry = {
+                "timestamp": datetime.now().isoformat(),
+                "model": self.model,
+                "optimize_mode": self.optimize_mode,
+                **data
+            }
+            with open(self.metrics_log_file, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(entry) + '\n')
+        except Exception as e:
+            print(f"⚠️  Не удалось записать метрики в лог: {e}")
+
+    def show_metrics(self, last_n: int = 5) -> None:
+        """Показывает последние N записей из лога метрик."""
+        if not self.metrics_log_file.exists():
+            print("📭 Лог метрик пуст.")
+            return
+        try:
+            with open(self.metrics_log_file, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+            recent = lines[-last_n:]
+            print(f"\n📊 Последние {len(recent)} записей метрик:")
+            for line in recent:
+                entry = json.loads(line)
+                print(f"  [{entry['timestamp']}] model={entry['model']} optimized={entry['optimize_mode']}")
+                if 'ttft' in entry:
+                    print(f"    TTFT: {entry['ttft']:.2f}s, Total: {entry['total_time']:.2f}s")
+                if 'eval_count' in entry:
+                    print(f"    Tokens: prompt={entry.get('prompt_eval_count','?')} eval={entry.get('eval_count','?')}")
+            print()
+        except Exception as e:
+            print(f"❌ Ошибка чтения лога: {e}")
+
 
 def print_welcome(model: str, rag_enabled: bool):
     print("=" * 60)
@@ -366,6 +537,10 @@ def print_help(rag_enabled: bool):
         print("  /rag search <q>   - поиск по индексу")
     else:
         print("  /rag init [path]  - включить RAG и создать индекс")
+    print("  /optimize [on|off] - вкл/выкл режим оптимизации")
+    print("  /set <param> <val> - установить параметр (temperature, max_tokens, history)")
+    print("  /loadconfig <file> - загрузить настройки из JSON")
+    print("  /metrics [N]       - показать последние N метрик")
     print("  /exit      - выйти из чата")
     print("  /help      - показать эту справку\n")
 
@@ -381,6 +556,29 @@ def handle_special_command(command: str, chat: LocalLLMChat) -> bool:
         chat.clear_context()
     elif cmd == "/count":
         chat.show_context_length()
+    elif cmd == "/optimize":
+        if len(parts) == 1:
+            chat.show_optimize_status()
+        else:
+            chat.toggle_optimize(parts[1])
+    elif cmd == "/set":
+        if len(parts) < 3:
+            print("❓ Используйте: /set <param> <value>")
+        else:
+            chat.set_param(parts[1], parts[2])
+    elif cmd == "/loadconfig":
+        if len(parts) < 2:
+            print("❓ Укажите путь к файлу конфигурации: /loadconfig <file>")
+        else:
+            chat.load_config(parts[1])
+    elif cmd == "/metrics":
+        n = 5
+        if len(parts) > 1:
+            try:
+                n = int(parts[1])
+            except ValueError:
+                print("❓ Неверное число. Показаны последние 5 записей.")
+        chat.show_metrics(n)
     elif cmd == "/rag":
         if len(parts) < 2:
             print("❓ Используйте: /rag [init|add|list|stats|delete|search]")
