@@ -687,6 +687,14 @@ def main():
         print(f"\n❌ Критическая ошибка: {e}")
         sys.exit(1)
 
+def create_chat_instance(model: str = "llama3.2:3b", 
+                         enable_rag: bool = True,
+                         no_rag: bool = False) -> LocalLLMChat:
+    """Фабрика для создания экземпляра чата (для использования в веб-интерфейсе)."""
+    return LocalLLMChat(
+        model=model,
+        no_rag=no_rag if not enable_rag else False
+    )
 
 if __name__ == "__main__":
     main()
